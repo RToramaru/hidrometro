@@ -176,7 +176,7 @@ class VideoProcessor:
         return os.path.exists(path)
     
     @staticmethod
-    def _letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
+    def _letterbox(im, new_shape=(YOLO_SIZE, YOLO_SIZE), color=(114, 114, 114)):
         """Redimensiona imagem com padding (letterbox)."""
         shape = im.shape[:2]
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
