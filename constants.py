@@ -31,7 +31,7 @@ CONFIG_MODELS_ENABLED = {
 # ============================================================
 # Processar a cada N frames (para não impactar FPS)
 # Quanto maior, mais rápido, mas menos frequente o processamento
-PROCESS_INTERVAL = 5
+PROCESS_INTERVAL = 30
 
 # Habilitar detecção automática de rotação no primeiro frame
 AUTO_ROTATION = True
@@ -47,7 +47,14 @@ ONNX_PROVIDERS_CPU_ONLY = ['CPUExecutionProvider']
 # CONFIGURAÇÕES DOS MODELOS
 # ============================================================
 SEG_SIZE = 512
-YOLO_SIZE = 640
+YOLO_SIZE = 384
+
+# 640 (Padrão - mais pesado)
+# 512 (Bom equilíbrio para ponteiros distantes)
+# 416 (Ótimo para CPU)
+# 384 (Muito rápido)
+# 320 (Extremamente rápido)
+# 256 (Limite mínimo recomendado para leitura de dígitos)
 
 # Thresholds
 THRESHOLD_UNET = 0.5
