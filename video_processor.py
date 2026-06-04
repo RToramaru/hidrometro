@@ -81,6 +81,7 @@ class VideoProcessor:
         self.upper_pointer_cache = 0.0
         self.lower_pointer_cache = 0.0
         self.pointer_boxes_cache = []
+        self.visor_bbox_target = None
         
         # Carregar modelos habilitados
         self._load_models()
@@ -190,7 +191,23 @@ class VideoProcessor:
         left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
         im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
         return im, r, dw, dh
-    
+
+    @staticmethod
+    def _select_top_yolo_boxes(raw_predictions, ratio, dw, dh, max_boxes=2):
+        """Seleciona as caixas de maior confiança a partir de predições YOLO."""
+        boxes = []
+        for pred in raw_predictions:
+            score = float(pred[4])
+            if score < CONF_THRESHOLD_YOLO:
+                continue
+            x1 = int(max(0, (pred[0] - dw) / ratio))
+            y1 = int(max(0, (pred[1] - dh) / ratio))
+            x2 = int(max(0, (pred[2] - dw) / ratio))
+            y2 = int(max(0, (pred[3] - dh) / ratio))
+            boxes.append((score, [x1, y1, x2, y2]))
+        boxes = sorted(boxes, key=lambda entry: entry[0], reverse=True)[:max_boxes]
+        return [entry[1] for entry in boxes]
+
     def calibrate(self, frame: np.ndarray) -> bool:
         """
         Calibra a rotação e homografia baseado no primeiro frame.
@@ -241,23 +258,14 @@ class VideoProcessor:
             yolo_inp = np.transpose(inp_img.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
             saida_bruta_yolo = self.yolo_detector.run(None, {self.input_names["ponteiros"]: yolo_inp})[0]
             
-            boxes_p = []
-            for pred in saida_bruta_yolo[0]:
-                if pred[4] < CONF_THRESHOLD_YOLO:
-                    continue
-                boxes_p.append([
-                    int(max(0, (pred[0] - dw) / ratio)),
-                    int(max(0, (pred[1] - dh) / ratio)),
-                    int(min(w_orig, (pred[2] - dw) / ratio)),
-                    int(min(h_orig, (pred[3] - dh) / ratio))
-                ])
-            
+            boxes_p = self._select_top_yolo_boxes(saida_bruta_yolo[0], ratio, dw, dh, max_boxes=2)
             if len(boxes_p) == 0:
                 print("⚠️ Falha na calibração: Ponteiros não detectados no Frame 1")
                 return False
-            
-            centro_x_ponteiros = np.mean([(b[0] + b[2]) / 2 for b in boxes_p])
-            centro_y_ponteiros = np.mean([(b[1] + b[3]) / 2 for b in boxes_p])
+
+            self.pointer_boxes_cache = sorted(boxes_p, key=lambda p: p[1])
+            centro_x_ponteiros = np.mean([(b[0] + b[2]) / 2 for b in self.pointer_boxes_cache])
+            centro_y_ponteiros = np.mean([(b[1] + b[3]) / 2 for b in self.pointer_boxes_cache])
             
             # 4. Determinar rotação ortogonal
             frame_calib = frame.copy()
@@ -334,6 +342,7 @@ class VideoProcessor:
             
             self.homography_matrix = cv2.getPerspectiveTransform(pts_origem, pts_destino)
             self.target_dimensions = (largura_visor + margem_w * 2, altura_visor + margem_h * 2)
+            self.visor_bbox_target = (margem_w, margem_h, largura_visor, altura_visor)
             self.calibrated = True
             
             print(f"[Calibração] ✓ Pronto! Rotação: {self.rotation_mode.name}, Homografia calculada")
@@ -414,27 +423,36 @@ class VideoProcessor:
             if not self.enabled_models.get("visor", False) or self.seg_visor is None:
                 return
             
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = frame.shape[:2]
+            # Se a ROI do visor já foi determinada na calibração, usar diretamente.
+            if self.visor_bbox_target is not None:
+                x_v, y_v, ww_v, hh_v = self.visor_bbox_target
+                crop_visor = frame[y_v:y_v + hh_v, x_v:x_v + ww_v]
+                if crop_visor.size == 0:
+                    self.visor_bbox_target = None
+                else:
+                    x_v, y_v = int(x_v), int(y_v)
+                    ww_v, hh_v = int(ww_v), int(hh_v)
             
-            # U-Net para máscara
-            seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).astype(np.float32) / 255.0
-            seg_inp = np.transpose(seg_inp, (2, 0, 1))[None, ...]
-            pred_seg = self.seg_visor.run(None, {self.input_names["visor"]: seg_inp})[0]
-            mask_prob = 1 / (1 + np.exp(-pred_seg))
-            mask_v = (np.squeeze(mask_prob) > THRESHOLD_UNET).astype(np.uint8)
-            mask_v = cv2.resize(mask_v, (w, h), interpolation=cv2.INTER_NEAREST)
-            
-            contours, _ = cv2.findContours(mask_v, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if len(contours) == 0:
-                return
-            
-            c = max(contours, key=cv2.contourArea)
-            x_v, y_v, ww_v, hh_v = cv2.boundingRect(c)
-            crop_visor = frame[y_v:y_v + hh_v, x_v:x_v + ww_v]
-            
-            if crop_visor.size == 0:
-                return
+            if self.visor_bbox_target is None:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w = frame.shape[:2]
+                
+                seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).astype(np.float32) / 255.0
+                seg_inp = np.transpose(seg_inp, (2, 0, 1))[None, ...]
+                pred_seg = self.seg_visor.run(None, {self.input_names["visor"]: seg_inp})[0]
+                mask_prob = 1 / (1 + np.exp(-pred_seg))
+                mask_v = (np.squeeze(mask_prob) > THRESHOLD_UNET).astype(np.uint8)
+                mask_v = cv2.resize(mask_v, (w, h), interpolation=cv2.INTER_NEAREST)
+                
+                contours, _ = cv2.findContours(mask_v, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if len(contours) == 0:
+                    return
+                
+                c = max(contours, key=cv2.contourArea)
+                x_v, y_v, ww_v, hh_v = cv2.boundingRect(c)
+                crop_visor = frame[y_v:y_v + hh_v, x_v:x_v + ww_v]
+                if crop_visor.size == 0:
+                    return
             
             crop_gray = cv2.cvtColor(crop_visor, cv2.COLOR_BGR2GRAY)
             crop_resized = cv2.resize(crop_gray, (128, 32), interpolation=cv2.INTER_LINEAR)
@@ -468,23 +486,25 @@ class VideoProcessor:
             yolo_inp = np.transpose(inp_img.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
             saida_bruta_yolo = self.yolo_detector.run(None, {self.input_names["ponteiros"]: yolo_inp})[0]
             
-            ponteiros_validos = []
+            detections = []
             for pred in saida_bruta_yolo[0]:
-                if pred[4] < CONF_THRESHOLD_YOLO:
+                score = float(pred[4])
+                if score < CONF_THRESHOLD_YOLO:
                     continue
-                ponteiros_validos.append([
-                    int(max(0, (pred[0] - dw) / ratio)),
-                    int(max(0, (pred[1] - dh) / ratio)),
-                    int(min(w, (pred[2] - dw) / ratio)),
-                    int(min(h, (pred[3] - dh) / ratio))
-                ])
-            
-            self.pointer_boxes_cache = sorted(ponteiros_validos, key=lambda p: p[1])
+                x1 = int(max(0, (pred[0] - dw) / ratio))
+                y1 = int(max(0, (pred[1] - dh) / ratio))
+                x2 = int(min(w, (pred[2] - dw) / ratio))
+                y2 = int(min(h, (pred[3] - dh) / ratio))
+                detections.append((score, [x1, y1, x2, y2]))
+
+            top_two = sorted(detections, key=lambda item: item[0], reverse=True)[:2]
+            self.pointer_boxes_cache = [box for _, box in top_two]
+            self.pointer_boxes_cache = sorted(self.pointer_boxes_cache, key=lambda p: p[1])
             valores_analogicos = []
             
-            # Processar cada ponteiro com YOLO Pose
+            # Processar apenas os dois ponteiros mais confiáveis com YOLO Pose
             if self.enabled_models.get("pose", False) and self.pose_session is not None:
-                for idx, (x1, y1, x2, y2) in enumerate(self.pointer_boxes_cache):
+                for (x1, y1, x2, y2) in self.pointer_boxes_cache:
                     crop_p = frame[y1:y2, x1:x2]
                     if crop_p.size == 0:
                         valores_analogicos.append(0.0)
