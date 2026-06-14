@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-import openvino as ov  # Migração nativa para OpenVINO
+import openvino as ov
 import math
 import time
 
@@ -16,7 +16,7 @@ YOLO_POSE_XML = "pesos/posicao_openvino.xml"
 
 SEG_SIZE = 512
 YOLO_SIZE = 640
-YOLO_POSE_SIZE = 320  # OTIMIZAÇÃO: Reduzido de 640 para 320 (Corta processamento da Pose na GPU)
+YOLO_POSE_SIZE = 320  # OTIMIZAÇÃO CRUCIAL: Mantém a Pose leve para a Iris Xe
 
 THRESHOLD_UNET = 0.5
 CONF_THRESHOLD_YOLO = 0.4
@@ -25,36 +25,34 @@ CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 print("Inicializando OpenVINO Core com Otimizações de Hardware Intel...")
 core = ov.Core()
-
-# Ativação de cache em disco para que a segunda execução seja instantânea
 core.set_property({'CACHE_DIR': './ov_cache_dir'})
 
-# OTIMIZAÇÃO: Configuração de performance para baixa latência aceita pela GPU Iris Xe
-config_gpu = {
-    "PERFORMANCE_HINT": "LATENCY"
-}
-
-# OTIMIZAÇÃO: Configuração de threads exclusiva para processamento em CPU (OCR)
-config_cpu = {
-    "INFERENCE_NUM_THREADS": "4"
-}
+# Voltando para o modo síncrono focado em latência pura e direta
+config_gpu = {"PERFORMANCE_HINT": "LATENCY"}
+config_cpu = {"INFERENCE_NUM_THREADS": "4"}
 
 print("Compilando modelos nativamente para Intel Iris Xe (GPU)...")
 t_start_comp = time.perf_counter()
-
 compiled_visor = core.compile_model(core.read_model(UNET_VISOR_XML), "GPU", config_gpu)
 compiled_yolo = core.compile_model(core.read_model(YOLO_PONTEIRO_XML), "GPU", config_gpu)
 compiled_pose = core.compile_model(core.read_model(YOLO_POSE_XML), "GPU", config_gpu)
 
 print("Compilando OCR para Intel Core i7 (CPU)...")
 compiled_ocr = core.compile_model(core.read_model(OCR_XML), "CPU", config_cpu)
-print(f"-> Tempo total de compilação/carregamento: {(time.perf_counter() - t_start_comp):.2f} segundos.")
+print(f"-> Tempo total de compilação: {(time.perf_counter() - t_start_comp):.2f} segundos.")
 
-# Criando as requisições de inferência
 infer_visor = compiled_visor.create_infer_request()
 infer_yolo = compiled_yolo.create_infer_request()
 infer_pose = compiled_pose.create_infer_request()
 infer_ocr = compiled_ocr.create_infer_request()
+
+# WARM-UP MANTIDO: Evita o engasgo do Frame 1 de forma limpa e síncrona
+print("[Warm-up] Aquecendo os motores da GPU com execução direta...")
+infer_visor.infer([np.ascontiguousarray(np.zeros((1, 3, SEG_SIZE, SEG_SIZE), dtype=np.float32))])
+infer_yolo.infer([np.ascontiguousarray(np.zeros((1, 3, YOLO_SIZE, YOLO_SIZE), dtype=np.float32))])
+infer_pose.infer([np.ascontiguousarray(np.zeros((1, 3, YOLO_POSE_SIZE, YOLO_POSE_SIZE), dtype=np.float32))])
+infer_ocr.infer([np.ascontiguousarray(np.zeros((1, 1, 32, 128), dtype=np.float32))])
+print("[Warm-up Concluído] Estabilidade garantida.")
 
 
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
@@ -94,13 +92,12 @@ def processar_video():
     p_inferior_cache = 0.0
     linhas_ponteiros_hud = []
 
-    # Variáveis para cálculo fluido de FPS real na tela
     fps_atual = 0.0
     acumulador_tempo_fps = 0.0
     contador_fps = 0
     t_anterior = time.perf_counter()
 
-    NOME_JANELA = "Monitoramento Ultra-Otimizado (OpenVINO IR Nativo)"
+    NOME_JANELA = "Monitoramento Otimizado Sincrono"
     cv2.namedWindow(NOME_JANELA, cv2.WINDOW_NORMAL)
 
     while True:
@@ -117,15 +114,14 @@ def processar_video():
         # CALIBRAÇÃO GEOMÉTRICA (APENAS FRAME 1)
         # -----------------------------------------------------
         if not calibrado:
-            print("\n[Calibração OpenVINO] Mapeando âncoras estáticas no primeiro frame...")
             t_inicio_calib = time.perf_counter()
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # 1. Inferência U-Net (Visor) via OpenVINO
             seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).astype(np.float32) / 255.0
             seg_inp = np.transpose(seg_inp, (2, 0, 1))[None, ...]
-            seg_inp = np.ascontiguousarray(seg_inp)  # Alinhamento de memória para hardware Intel
+            seg_inp = np.ascontiguousarray(seg_inp)
 
+            # Voltou para infer síncrono (Mais estável para processadores Intel U)
             pred_seg = infer_visor.infer([seg_inp])[0]
             mask_prob = 1 / (1 + np.exp(-pred_seg))
             mask_v = (np.squeeze(mask_prob) > THRESHOLD_UNET).astype(np.uint8)
@@ -138,7 +134,6 @@ def processar_video():
             centro_x_visor = x_b + (w_b / 2)
             centro_y_visor = y_b + (h_b / 2)
 
-            # 2. Inferência YOLO (Detecção) via OpenVINO
             inp_img, ratio, dw, dh = letterbox(frame_rgb, new_shape=(YOLO_SIZE, YOLO_SIZE))
             yolo_inp = np.transpose(inp_img.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
             yolo_inp = np.ascontiguousarray(yolo_inp)
@@ -159,7 +154,6 @@ def processar_video():
             centro_x_ponteiros = np.mean([(b[0] + b[2]) / 2 for b in caixas_p])
             centro_y_ponteiros = np.mean([(b[1] + b[3]) / 2 for b in caixas_p])
 
-            # 3. Orientação Ortogonal
             frame_calib = frame.copy()
             mask_calib = mask_v.copy()
             if h_b > w_b:
@@ -179,7 +173,6 @@ def processar_video():
 
             h_c, w_c = frame_calib.shape[:2]
 
-            # 4. Ajuste Fino Angular
             contours_c, _ = cv2.findContours(mask_calib, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             maior_cnt_c = max(contours_c, key=cv2.contourArea)
             rect = cv2.minAreaRect(maior_cnt_c)
@@ -198,7 +191,6 @@ def processar_video():
                 contours_c, _ = cv2.findContours(mask_calib, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 maior_cnt_c = max(contours_c, key=cv2.contourArea)
 
-            # 5. Homografia Estabilizada
             rect = cv2.minAreaRect(maior_cnt_c)
             box = cv2.boxPoints(rect).astype(np.intp)
             pts_origem = np.zeros((4, 2), dtype="float32")
@@ -212,19 +204,14 @@ def processar_video():
             dim1, dim2 = rect[1]
             largura_visor = int(max(dim1, dim2))
             altura_visor = int(min(dim1, dim2))
-            margem_w, margem_h = int(largura_visor * 1.2), int(altura_visor * 4.5)
+            margem_w, margem_h = int(largura_visor * 0.8), int(altura_visor * 3.0)
 
-            pts_destino = np.array([
-                [margem_w, margem_h],
-                [margem_w + largura_visor, margem_h],
-                [margem_w + largura_visor, margem_h + altura_visor],
-                [margem_w, margem_h + altura_visor]
-            ], dtype="float32")
-
-            Matriz_H = cv2.getPerspectiveTransform(pts_origem, pts_destino)
+            Matriz_H = cv2.getPerspectiveTransform(pts_origem, pts_destino := np.array([
+                [margem_w, margem_h], [margem_w + largura_visor, margem_h],
+                [margem_w + largura_visor, margem_h + altura_visor], [margem_w, margem_h + altura_visor]
+            ], dtype="float32"))
             dimensoes_finais = (largura_visor + margem_w * 2, altura_visor + margem_h * 2)
 
-            # 6. Mapeamento Estático no Espaço Estabilizado
             frame_piloto_est = cv2.warpPerspective(frame_calib, Matriz_H, dimensoes_finais)
             h_est, w_est = frame_piloto_est.shape[:2]
             img_rgb_est = cv2.cvtColor(frame_piloto_est, cv2.COLOR_BGR2RGB)
@@ -254,10 +241,10 @@ def processar_video():
                 ])
             caixas_ponteiros_estaticas = sorted(ponteiros_validos, key=lambda p: p[1])
             calibrado = True
-            print(f"[Calibração Concluída com Sucesso]: {(time.perf_counter() - t_inicio_calib) * 1000:.1f}ms")
+            print(f"[Calibração Concluída]: {(time.perf_counter() - t_inicio_calib) * 1000:.1f}ms")
 
         # -----------------------------------------------------
-        # PROCESSAMENTO EM TEMPO REAL (REUSO DE COORDENADAS)
+        # PROCESSAMENTO EM TEMPO REAL
         # -----------------------------------------------------
         t_inicio_warp = time.perf_counter()
         if rotation_step is not None:
@@ -275,7 +262,7 @@ def processar_video():
             linhas_ponteiros_hud.clear()
             valores_analogicos = []
 
-            # 1. OCR Nativo OpenVINO (Executado na CPU i7)
+            # 1. OCR Síncrono em CPU
             t_inicio_ocr = time.perf_counter()
             if bbox_visor_estatico is not None:
                 x_v, y_v, ww_v, hh_v = bbox_visor_estatico
@@ -298,7 +285,7 @@ def processar_video():
                     if not texto_ocr_cache: texto_ocr_cache = "..."
             tempo_ocr_ms = (time.perf_counter() - t_inicio_ocr) * 1000.0
 
-            # 2. YOLO Pose Nativo OpenVINO (Executado na GPU Iris Xe)
+            # 2. YOLO Pose Síncrono em GPU
             t_inicio_pose = time.perf_counter()
             for idx, ponteiro in enumerate(caixas_ponteiros_estaticas):
                 x1, y1, x2, y2 = ponteiro
@@ -306,7 +293,6 @@ def processar_video():
                 if crop_p.size == 0: continue
 
                 crop_rgb = cv2.cvtColor(crop_p, cv2.COLOR_BGR2RGB)
-                # Redimensionamento inteligente otimizado para 320x320
                 inp_pose, ratio_p, dw_p, dh_p = letterbox(crop_rgb, new_shape=(YOLO_POSE_SIZE, YOLO_POSE_SIZE))
                 inp_p_tensor = np.transpose(inp_pose.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
                 inp_p_tensor = np.ascontiguousarray(inp_p_tensor)
@@ -338,15 +324,15 @@ def processar_video():
                             "ponta": (int(x1 + ponta_x), int(y1 + ponta_y))
                         })
                     else:
-                        valores_analogicos.append(0.0)
+                        values = 0.0
                 else:
-                    valores_analogicos.append(0.0)
+                    values = 0.0
 
             p_superior_cache = valores_analogicos[0] if len(valores_analogicos) > 0 else 0.0
             p_inferior_cache = valores_analogicos[1] if len(valores_analogicos) > 1 else 0.0
             tempo_pose_ms = (time.perf_counter() - t_inicio_pose) * 1000.0
 
-        # --- HUD DE RENDERIZAÇÃO ---
+        # --- HUD ---
         for idx, ponteiro in enumerate(caixas_ponteiros_estaticas, start=1):
             cv2.rectangle(frame_estabilizado, (ponteiro[0], ponteiro[1]), (ponteiro[2], ponteiro[3]), (255, 0, 0), 2)
         for pts_hud in linhas_ponteiros_hud:
@@ -356,7 +342,6 @@ def processar_video():
                           (bbox_visor_estatico[0] + bbox_visor_estatico[2],
                            bbox_visor_estatico[1] + bbox_visor_estatico[3]), (0, 255, 0), 2)
 
-        # Cálculo dinâmico das médias de FPS real (calculado a cada 10 frames)
         t_fim_frame = time.perf_counter()
         tempo_total_frame_ms = (t_fim_frame - t_inicio_frame) * 1000.0
 
@@ -372,7 +357,6 @@ def processar_video():
         print(
             f"Frame {contador_frames:04d} [{tipo_frame}] -> Total: {tempo_total_frame_ms:.1f}ms | Warp: {tempo_warp:.1f}ms | OCR: {tempo_ocr_ms:.1f}ms | Pose (x2): {tempo_pose_ms:.1f}ms | FPS: {fps_atual:.1f}")
 
-        # HUD superior unificado na janela de exibição
         cv2.rectangle(frame_estabilizado, (0, 0), (frame_estabilizado.shape[1], 45), (0, 0, 0), -1)
         telemetria = f"FPS: {fps_atual:.1f} ({tempo_total_frame_ms:.1f}ms) | OCR: {texto_ocr_cache} | P. Sup: {p_superior_cache:.1f} | P. Inf: {p_inferior_cache:.1f}"
         cv2.putText(frame_estabilizado, telemetria, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
