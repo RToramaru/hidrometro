@@ -9,7 +9,6 @@ import time
 # =========================================================
 VIDEO_PATH = "videos/1000lh.mp4"
 
-# Caminhos para os dois formatos de pesos
 MODELOS = {
     "visor": {"xml": "pesos/visor_openvino.xml", "onnx": "pesos/visor.onnx"},
     "yolo": {"xml": "pesos/ponteiro_openvino.xml", "onnx": "pesos/ponteiro.onnx"},
@@ -39,7 +38,6 @@ class HybridInferenceEngine:
         self.core = ov.Core()
         self.core.set_property({'CACHE_DIR': './ov_cache_dir'})
 
-        # Tenta detetar suporte a CUDA via ONNX Runtime primeiro
         try:
             import onnxruntime as ort
             available_providers = ort.get_available_providers()
@@ -47,15 +45,11 @@ class HybridInferenceEngine:
                 self.backend = "CUDA"
                 self.ort = ort
                 print("[Engine] CUDA (NVIDIA) detetado com sucesso via ONNX Runtime.")
-            else:
-                print("[Engine] ONNX Runtime disponível, mas CUDAExecutionProvider não foi encontrado.")
         except ImportError:
-            print("[Engine] Biblioteca 'onnxruntime' não instalada. Ignorando validação de CUDA.")
+            pass
 
-        # Se não houver CUDA, recorre ao OpenVINO (GPU Intel ou CPU)
         if self.backend == "CPU":
             ov_devices = self.core.available_devices
-            print(f"[Engine] Dispositivos OpenVINO detetados: {ov_devices}")
             if any("GPU" in dev for dev in ov_devices):
                 self.backend = "OPENVINO_GPU"
             else:
@@ -64,14 +58,12 @@ class HybridInferenceEngine:
         print(f"--> [BACKEND SELECIONADO]: {self.backend}\n")
 
     def load_model(self, model_keys, target_forced_backend=None):
-        """ Carrega o modelo correto (.onnx ou .xml) dependendo do hardware escolhido """
         backend_atual = target_forced_backend if target_forced_backend else self.backend
         engine = HybridInferenceEngineInstance()
         engine.backend = backend_atual
 
         if backend_atual == "CUDA":
             onnx_path = model_keys["onnx"]
-            print(f"Carregando {onnx_path} na GPU via CUDA (ONNX Runtime)...")
             engine.ort_session = self.ort.InferenceSession(
                 onnx_path,
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
@@ -80,16 +72,13 @@ class HybridInferenceEngine:
         else:
             xml_path = model_keys["xml"]
             device = "GPU" if backend_atual == "OPENVINO_GPU" else "CPU"
-            print(f"Carregando {xml_path} no hardware {device} via OpenVINO...")
-
             config = {"PERFORMANCE_HINT": "LATENCY"} if device == "GPU" else {"INFERENCE_NUM_THREADS": "0"}
 
             try:
                 model = self.core.read_model(xml_path)
                 engine.ov_model = model
                 engine.ov_compiled_model = self.core.compile_model(model, device, config)
-            except Exception as e:
-                print(f"[Aviso] Falha ao compilar no dispositivo {device}: {e}. Forçando fallback para CPU...")
+            except Exception:
                 engine.backend = "OPENVINO_CPU"
                 model = self.core.read_model(xml_path)
                 engine.ov_model = model
@@ -110,10 +99,7 @@ class HybridInferenceEngineInstance:
         self.input_name = None
 
     def reshape_and_recompile(self, core, batch_size, size):
-        """ Permite alterar dinamicamente o tamanho do lote (Batch) para o YOLO Pose """
-        if self.backend == "CUDA":
-            pass
-        else:
+        if self.backend != "CUDA":
             self.ov_model.reshape({self.ov_model.inputs[0]: [batch_size, 3, size, size]})
             device = "GPU" if self.backend == "OPENVINO_GPU" else "CPU"
             config = {"PERFORMANCE_HINT": "LATENCY"} if device == "GPU" else {"INFERENCE_NUM_THREADS": "0"}
@@ -121,7 +107,6 @@ class HybridInferenceEngineInstance:
             self.ov_infer_request = self.ov_compiled_model.create_infer_request()
 
     def infer(self, tensor_input):
-        """ Executa a inferência de forma unificada """
         if self.backend == "CUDA":
             outputs = self.ort_session.run(None, {self.input_name: tensor_input})
             return outputs[0]
@@ -136,8 +121,7 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
-    dw /= 2;
-    dh /= 2
+    dw /= 2; dh /= 2
     if shape[::-1] != new_unpad:
         im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
@@ -161,14 +145,16 @@ def processar_video():
         return
 
     calibrado = False
-    Matriz_H, dimensoes_finais, rotation_step = None, None, None
+    rotation_step = None
     bbox_visor_estatico = None
     caixas_ponteiros_estaticas = []
     params_letterbox_ponteiros = []
+    map_x, map_y = None, None
 
     contador_frames = 0
     texto_ocr_cache = "..."
-    ocr_inicial_realizado = False  # Controla se a leitura válida inicial foi efetuada
+    ocr_inicial_realizado = False
+    ocr_no_zero_realizado = False  # Garante que no 0.0 o OCR rode apenas UMA vez
     p_superior_cache, p_inferior_cache = 0.0, 0.0
 
     acumulador_tempo_fps = 0.0
@@ -196,8 +182,8 @@ def processar_video():
             print(f"\n[Calibração Estática] Executando rotinas iniciais adaptadas...")
             t_inicio_calib = time.perf_counter()
 
-            seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).astype(np.float32) / 255.0
-            seg_inp = np.moveaxis(seg_inp, -1, 0)[None, ...].astype(np.float32)
+            seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32,
+                                                                                                       copy=False) / 255.0
             seg_inp = np.ascontiguousarray(seg_inp)
 
             pred_seg = model_visor.infer(seg_inp)
@@ -213,19 +199,17 @@ def processar_video():
             centro_y_visor = y_b + (h_b / 2)
 
             inp_img, ratio, dw, dh = letterbox(frame_rgb, new_shape=(YOLO_SIZE, YOLO_SIZE))
-            yolo_inp = np.moveaxis(inp_img.astype(np.float32) / 255.0, -1, 0)[None, ...].astype(np.float32)
+            yolo_inp = inp_img.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
             yolo_inp = np.ascontiguousarray(yolo_inp)
 
             saida_bruta_yolo = model_yolo.infer(yolo_inp)
-
             saida_bruta_yolo = np.squeeze(saida_bruta_yolo)
             if len(saida_bruta_yolo.shape) == 1:
                 saida_bruta_yolo = np.expand_dims(saida_bruta_yolo, axis=0)
 
             caixas_p = []
             for pred in saida_bruta_yolo:
-                if len(pred) < 5: continue
-                if pred[4] < CONF_THRESHOLD_YOLO: continue
+                if len(pred) < 5 or pred[4] < CONF_THRESHOLD_YOLO: continue
                 caixas_p.append([
                     int(max(0, (pred[0] - dw) / ratio)), int(max(0, (pred[1] - dh) / ratio)),
                     int(min(w_orig, (pred[2] - dw) / ratio)), int(min(h_orig, (pred[3] - dh) / ratio))
@@ -296,12 +280,20 @@ def processar_video():
             Matriz_H = cv2.getPerspectiveTransform(pts_origem, pts_destino)
             dimensoes_finais = (largura_visor + margem_w * 2, altura_visor + margem_h * 2)
 
-            frame_piloto_est_rgb = cv2.warpPerspective(frame_calib_rgb, Matriz_H, dimensoes_finais,
-                                                       flags=cv2.INTER_LINEAR)
+            # --- CORREÇÃO DA MATRIZ DO REMAP ---
+            H_inv = np.linalg.inv(Matriz_H)
+            grid_y, grid_x = np.indices((dimensoes_finais[1], dimensoes_finais[0]), dtype=np.float32)
+
+            w_div = H_inv[2, 0] * grid_x + H_inv[2, 1] * grid_y + H_inv[2, 2]
+            # Garantimos explicitamente que os mapas finais sejam gerados como float32 isolados
+            map_x = ((H_inv[0, 0] * grid_x + H_inv[0, 1] * grid_y + H_inv[0, 2]) / w_div).astype(np.float32)
+            map_y = ((H_inv[1, 0] * grid_x + H_inv[1, 1] * grid_y + H_inv[1, 2]) / w_div).astype(np.float32)
+
+            frame_piloto_est_rgb = cv2.remap(frame_calib_rgb, map_x, map_y, cv2.INTER_LINEAR)
             h_est, w_est = frame_piloto_est_rgb.shape[:2]
 
-            seg_inp_est = cv2.resize(frame_piloto_est_rgb, (SEG_SIZE, SEG_SIZE)).astype(np.float32) / 255.0
-            seg_inp_est = np.moveaxis(seg_inp_est, -1, 0)[None, ...].astype(np.float32)
+            seg_inp_est = cv2.resize(frame_piloto_est_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(
+                np.float32, copy=False) / 255.0
             seg_inp_est = np.ascontiguousarray(seg_inp_est)
 
             pred_seg_est = model_visor.infer(seg_inp_est)
@@ -312,7 +304,7 @@ def processar_video():
                 bbox_visor_estatico = cv2.boundingRect(max(contours_est, key=cv2.contourArea))
 
             inp_img_est, ratio_est, dw_est, dh_est = letterbox(frame_piloto_est_rgb, new_shape=(YOLO_SIZE, YOLO_SIZE))
-            yolo_inp_est = np.moveaxis(inp_img_est.astype(np.float32) / 255.0, -1, 0)[None, ...].astype(np.float32)
+            yolo_inp_est = inp_img_est.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
             yolo_inp_est = np.ascontiguousarray(yolo_inp_est)
             saida_bruta_yolo_est = model_yolo.infer(yolo_inp_est)
 
@@ -322,8 +314,7 @@ def processar_video():
 
             ponteiros_validos = []
             for pred in saida_bruta_yolo_est:
-                if len(pred) < 5: continue
-                if pred[4] < CONF_THRESHOLD_YOLO: continue
+                if len(pred) < 5 or pred[4] < CONF_THRESHOLD_YOLO: continue
                 ponteiros_validos.append([
                     int(max(0, (pred[0] - dw_est) / ratio_est)), int(max(0, (pred[1] - dh_est) / ratio_est)),
                     int(min(w_est, (pred[2] - dw_est) / ratio_est)), int(min(h_est, (pred[3] - dh_est) / ratio_est))
@@ -354,27 +345,24 @@ def processar_video():
         if rotation_step is not None:
             frame_rgb = cv2.rotate(frame_rgb, rotation_step)
 
-        frame_estabilizado_rgb = cv2.warpPerspective(frame_rgb, Matriz_H, dimensoes_finais, flags=cv2.INTER_LINEAR)
+        frame_estabilizado_rgb = cv2.remap(frame_rgb, map_x, map_y, cv2.INTER_LINEAR)
         valores_analogicos = []
-        # YOLO Pose Batch
+
         if len(caixas_ponteiros_estaticas) > 0:
             for idx, ponteiro in enumerate(caixas_ponteiros_estaticas):
                 x1, y1, x2, y2 = ponteiro
                 crop_p_rgb = frame_estabilizado_rgb[y1:y2, x1:x2]
                 if crop_p_rgb.size == 0: continue
 
-                r_p, dw_p, dh_p, nu_w, nu_h = params_letterbox_ponteiros[idx]
-                crop_resized = cv2.resize(crop_p_rgb, (nu_w, nu_h), interpolation=cv2.INTER_LINEAR)
+                r_p, dw_p, dh_p, _, _ = params_letterbox_ponteiros[idx]
+                top, left = int(round(dh_p - 0.1)), int(round(dw_p - 0.1))
 
-                top, bottom = int(round(dh_p - 0.1)), int(round(dh_p + 0.1))
-                left, right = int(round(dw_p - 0.1)), int(round(dw_p + 0.1))
-                crop_padded = cv2.copyMakeBorder(crop_resized, top, bottom, left, right, cv2.BORDER_CONSTANT,
-                                                 value=(114, 114, 114))
+                crop_padded = np.full((YOLO_POSE_SIZE, YOLO_POSE_SIZE, 3), 114, dtype=np.uint8)
+                crop_resized = cv2.resize(crop_p_rgb, (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2),
+                                          interpolation=cv2.INTER_LINEAR)
+                crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
 
-                if crop_padded.shape[0] != YOLO_POSE_SIZE or crop_padded.shape[1] != YOLO_POSE_SIZE:
-                    crop_padded = cv2.resize(crop_padded, (YOLO_POSE_SIZE, YOLO_POSE_SIZE))
-
-                buffer_pose_batch[idx] = np.moveaxis(crop_padded.astype(np.float32) / 255.0, -1, 0)
+                buffer_pose_batch[idx] = crop_padded.transpose(2, 0, 1).astype(np.float32, copy=False) / 255.0
 
             preds_pose_batch = model_pose.infer(buffer_pose_batch)
 
@@ -387,13 +375,12 @@ def processar_video():
                 preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[1] else single_pred
                 r_p, dw_p, dh_p, _, _ = params_letterbox_ponteiros[idx]
 
-                melhor_score = 0.0
                 melhor_pred = None
-                for pred in preds_pose:
-                    if len(pred) < 5: continue
-                    if pred[4] > melhor_score and pred[4] >= CONF_THRESHOLD_POSE:
-                        melhor_score = pred[4]
-                        melhor_pred = pred
+                if preds_pose.shape[0] > 0:
+                    scores = preds_pose[:, 4]
+                    idx_max = np.argmax(scores)
+                    if scores[idx_max] >= CONF_THRESHOLD_POSE:
+                        melhor_pred = preds_pose[idx_max]
 
                 if melhor_pred is not None:
                     kpts = melhor_pred[5:]
@@ -406,21 +393,15 @@ def processar_video():
                         angulo_ajustated = math.degrees(math.atan2(ponta_y - eixo_y, ponta_x - eixo_x)) + 90.0
                         if angulo_ajustated < 0: angulo_ajustated += 360.0
 
-                        # Valor original arredondado para uma casa decimal
                         valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
 
-                        # CORREÇÃO: 10.0 na escala do ponteiro circular é na verdade o ponto 0.0
                         if valor_original == 10.0:
                             valor_original = 0.0
 
-                        # Extrai apenas o dígito da primeira casa decimal
                         decimais = int(round((valor_original - int(valor_original)) * 10))
-
-                        # Se a casa decimal for ímpar, recua 1 dígito para torná-la par
                         if decimais % 2 != 0:
                             valor_original = round(valor_original - 0.1, 1)
-                            if valor_original < 0.0:
-                                valor_original = 0.0
+                            if valor_original < 0.0: valor_original = 0.0
 
                         valores_analogicos.append(valor_original)
                     else:
@@ -428,23 +409,22 @@ def processar_video():
                 else:
                     valores_analogicos.append(0.0)
 
-            # LÓGICA DE FILTRAGEM ASCENDENTE (TRAVA DE VALOR)
-            # Os valores só podem subir até chegar a 0,0. Flutuações para baixo são ignoradas.
-            # if len(valores_analogicos) > 0:
-            #     novo_sup = valores_analogicos[0]
-            #     # Atualiza se o valor subiu OU se atingiu exatamente o objetivo de zerar (0.0)
-            #     if novo_sup > p_superior_cache or novo_sup == 0.0:
-            #         p_superior_cache = novo_sup
-            #
-            # if len(valores_analogicos) > 1:
-            #     novo_inf = valores_analogicos[1]
-            #     if novo_inf > p_inferior_cache or novo_inf == 0.0:
-            #         p_inferior_cache = novo_inf
+            if len(valores_analogicos) > 0:
+                p_superior_cache = valores_analogicos[0]
+            if len(valores_analogicos) > 1:
+                p_inferior_cache = valores_analogicos[1]
 
+        # -----------------------------------------------------
+        # CONTROLE INTELIGENTE DO OCR
+        # -----------------------------------------------------
+        deve_processar_ocr = False
+        if not ocr_inicial_realizado:
+            deve_processar_ocr = True
+        elif p_superior_cache == 0.0 and not ocr_no_zero_realizado:
+            deve_processar_ocr = True
 
-        # CONDICIONAL: Executa continuamente até encontrar o primeiro valor inicial válido,
-        # OU executa se o ponteiro superior atingir exatamente 0.0
-        deve_processar_ocr = (not ocr_inicial_realizado) or (p_superior_cache == 0.0)
+        if p_superior_cache != 0.0:
+            ocr_no_zero_realizado = False
 
         if deve_processar_ocr and bbox_visor_estatico is not None:
             x_v, y_v, ww_v, hh_v = bbox_visor_estatico
@@ -467,25 +447,26 @@ def processar_video():
                 if len(texto_temp) > 6:
                     texto_temp = texto_temp[:6]
 
-                # Se obteve um resultado "string" real válido do OCR (não vazio e diferente de "...")
                 if texto_temp.strip() and texto_temp != "...":
                     texto_ocr_cache = texto_temp
-                    ocr_inicial_realizado = True  # Bloqueia execuções repetidas até p_superior_cache == 0,0
+                    if not ocr_inicial_realizado:
+                        ocr_inicial_realizado = True
+                    elif p_superior_cache == 0.0:
+                        ocr_no_zero_realizado = True
 
-        # --- PROCESSAMENTO GRÁFICO ---
+                        # --- PROCESSAMENTO GRÁFICO ---
         frame_render = cv2.cvtColor(frame_estabilizado_rgb, cv2.COLOR_RGB2BGR)
 
         t_fim_frame = time.perf_counter()
-
         acumulador_tempo_fps += (t_fim_frame - t_anterior)
         t_anterior = t_fim_frame
         contador_fps += 1
         if contador_fps >= 10:
-            contador_fps = 0;
+            contador_fps = 0
             acumulador_tempo_fps = 0.0
-        # HUD Superior Sem Contador de FPS
+
         cv2.rectangle(frame_render, (0, 0), (frame_render.shape[1], 45), (0, 0, 0), -1)
-        telemetria = f"OCR: {texto_ocr_cache} | P. Sup: {valores_analogicos[0]:.1f} | P. Inf: {valores_analogicos[1]:.1f}"
+        telemetria = f"OCR: {texto_ocr_cache} | P. Sup: {p_superior_cache:.1f} | P. Inf: {p_inferior_cache:.1f}"
         cv2.putText(frame_render, telemetria, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow(NOME_JANELA, frame_render)
@@ -493,7 +474,6 @@ def processar_video():
 
     cap.release()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     processar_video()
