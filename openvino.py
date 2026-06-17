@@ -3,7 +3,6 @@ import numpy as np
 import openvino as ov
 import math
 import time
-import os
 
 # =========================================================
 # CONFIGURAÇÕES GERAIS E CAMINHOS DOS MODELOS
@@ -168,11 +167,10 @@ def processar_video():
     params_letterbox_ponteiros = []
 
     contador_frames = 0
-    texto_ocr_cache = "Carregando..."
+    texto_ocr_cache = "..."
+    ocr_inicial_realizado = False  # Controla se a leitura válida inicial foi efetuada
     p_superior_cache, p_inferior_cache = 0.0, 0.0
-    linhas_ponteiros_hud = []
 
-    fps_atual = 0.0
     acumulador_tempo_fps = 0.0
     contador_fps = 0
     t_anterior = time.perf_counter()
@@ -184,8 +182,6 @@ def processar_video():
     buffer_pose_batch = None
 
     while True:
-        t_inicio_frame = time.perf_counter()
-
         ret, frame = cap.read()
         if not ret: break
 
@@ -222,15 +218,12 @@ def processar_video():
 
             saida_bruta_yolo = model_yolo.infer(yolo_inp)
 
-            # --- TRATAMENTO CORRIGIDO PARA PARS_DYNAMIC DO MODELO YOLO ---
-            # Remove dimensões extras em batch unitário se necessário [1, 1, N, 6] ou [1, N, 6]
             saida_bruta_yolo = np.squeeze(saida_bruta_yolo)
             if len(saida_bruta_yolo.shape) == 1:
                 saida_bruta_yolo = np.expand_dims(saida_bruta_yolo, axis=0)
 
             caixas_p = []
             for pred in saida_bruta_yolo:
-                # Garante que estamos lendo uma linha unidimensional válida
                 if len(pred) < 5: continue
                 if pred[4] < CONF_THRESHOLD_YOLO: continue
                 caixas_p.append([
@@ -323,7 +316,6 @@ def processar_video():
             yolo_inp_est = np.ascontiguousarray(yolo_inp_est)
             saida_bruta_yolo_est = model_yolo.infer(yolo_inp_est)
 
-            # Aplica o mesmo tratamento de squeeze na calibração estática
             saida_bruta_yolo_est = np.squeeze(saida_bruta_yolo_est)
             if len(saida_bruta_yolo_est.shape) == 1:
                 saida_bruta_yolo_est = np.expand_dims(saida_bruta_yolo_est, axis=0)
@@ -359,38 +351,12 @@ def processar_video():
         # -----------------------------------------------------
         # PROCESSAMENTO EM TEMPO REAL
         # -----------------------------------------------------
-        t_inicio_warp = time.perf_counter()
         if rotation_step is not None:
             frame_rgb = cv2.rotate(frame_rgb, rotation_step)
 
         frame_estabilizado_rgb = cv2.warpPerspective(frame_rgb, Matriz_H, dimensoes_finais, flags=cv2.INTER_LINEAR)
-        tempo_warp = (time.perf_counter() - t_inicio_warp) * 1000.0
-
-        linhas_ponteiros_hud.clear()
         valores_analogicos = []
-
-        # OCR na CPU
-        if bbox_visor_estatico is not None:
-            x_v, y_v, ww_v, hh_v = bbox_visor_estatico
-            crop_visor_rgb = frame_estabilizado_rgb[y_v:y_v + hh_v, x_v:x_v + ww_v]
-            if crop_visor_rgb.size > 0:
-                crop_gray = cv2.cvtColor(crop_visor_rgb, cv2.COLOR_RGB2GRAY)
-                crop_resized = cv2.resize(crop_gray, (128, 32), interpolation=cv2.INTER_LINEAR)
-                buffer_ocr_inp[0, 0, :, :] = crop_resized / 255.0
-
-                pred_ocr = model_ocr.infer(buffer_ocr_inp)
-                pred_argmax = np.argmax(pred_ocr, axis=2).flatten()
-
-                texto_ocr_cache = ""
-                last = -1
-                for p in pred_argmax:
-                    if p != last and p != 0 and (p - 1) < len(CHARS):
-                        texto_ocr_cache += CHARS[p - 1]
-                    last = p
-                if not texto_ocr_cache: texto_ocr_cache = "..."
-
         # YOLO Pose Batch
-        t_inicio_pose = time.perf_counter()
         if len(caixas_ponteiros_estaticas) > 0:
             for idx, ponteiro in enumerate(caixas_ponteiros_estaticas):
                 x1, y1, x2, y2 = ponteiro
@@ -413,8 +379,6 @@ def processar_video():
             preds_pose_batch = model_pose.infer(buffer_pose_batch)
 
             for idx, ponteiro in enumerate(caixas_ponteiros_estaticas):
-                x1, y1, x2, y2 = ponteiro
-
                 single_pred = preds_pose_batch[idx]
                 single_pred = np.squeeze(single_pred)
                 if len(single_pred.shape) == 1:
@@ -439,47 +403,89 @@ def processar_video():
                         ponta_x = (kpts[3] - dw_p) / r_p
                         ponta_y = (kpts[4] - dh_p) / r_p
 
-                        angulo_ajustado = math.degrees(math.atan2(ponta_y - eixo_y, ponta_x - eixo_x)) + 90.0
-                        if angulo_ajustado < 0: angulo_ajustado += 360.0
-                        valores_analogicos.append(round((angulo_ajustado % 360.0) / 36.0, 1))
+                        angulo_ajustated = math.degrees(math.atan2(ponta_y - eixo_y, ponta_x - eixo_x)) + 90.0
+                        if angulo_ajustated < 0: angulo_ajustated += 360.0
 
-                        linhas_ponteiros_hud.append({
-                            "eixo": (int(x1 + eixo_x), int(y1 + eixo_y)),
-                            "ponta": (int(x1 + ponta_x), int(y1 + ponta_y))
-                        })
+                        # Valor original arredondado para uma casa decimal
+                        valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
+
+                        # CORREÇÃO: 10.0 na escala do ponteiro circular é na verdade o ponto 0.0
+                        if valor_original == 10.0:
+                            valor_original = 0.0
+
+                        # Extrai apenas o dígito da primeira casa decimal
+                        decimais = int(round((valor_original - int(valor_original)) * 10))
+
+                        # Se a casa decimal for ímpar, recua 1 dígito para torná-la par
+                        if decimais % 2 != 0:
+                            valor_original = round(valor_original - 0.1, 1)
+                            if valor_original < 0.0:
+                                valor_original = 0.0
+
+                        valores_analogicos.append(valor_original)
                     else:
                         valores_analogicos.append(0.0)
                 else:
                     valores_analogicos.append(0.0)
 
-            p_superior_cache = valores_analogicos[0] if len(valores_analogicos) > 0 else 0.0
-            p_inferior_cache = valores_analogicos[1] if len(valores_analogicos) > 1 else 0.0
-            tempo_pose_ms = (time.perf_counter() - t_inicio_pose) * 1000.0
+            # LÓGICA DE FILTRAGEM ASCENDENTE (TRAVA DE VALOR)
+            # Os valores só podem subir até chegar a 0,0. Flutuações para baixo são ignoradas.
+            # if len(valores_analogicos) > 0:
+            #     novo_sup = valores_analogicos[0]
+            #     # Atualiza se o valor subiu OU se atingiu exatamente o objetivo de zerar (0.0)
+            #     if novo_sup > p_superior_cache or novo_sup == 0.0:
+            #         p_superior_cache = novo_sup
+            #
+            # if len(valores_analogicos) > 1:
+            #     novo_inf = valores_analogicos[1]
+            #     if novo_inf > p_inferior_cache or novo_inf == 0.0:
+            #         p_inferior_cache = novo_inf
 
-        # --- PROCESSAMENTO GRÁFICO (REGRAS DE OCULTAÇÃO) ---
+
+        # CONDICIONAL: Executa continuamente até encontrar o primeiro valor inicial válido,
+        # OU executa se o ponteiro superior atingir exatamente 0.0
+        deve_processar_ocr = (not ocr_inicial_realizado) or (p_superior_cache == 0.0)
+
+        if deve_processar_ocr and bbox_visor_estatico is not None:
+            x_v, y_v, ww_v, hh_v = bbox_visor_estatico
+            crop_visor_rgb = frame_estabilizado_rgb[y_v:y_v + hh_v, x_v:x_v + ww_v]
+            if crop_visor_rgb.size > 0:
+                crop_gray = cv2.cvtColor(crop_visor_rgb, cv2.COLOR_RGB2GRAY)
+                crop_resized = cv2.resize(crop_gray, (128, 32), interpolation=cv2.INTER_LINEAR)
+                buffer_ocr_inp[0, 0, :, :] = crop_resized / 255.0
+
+                pred_ocr = model_ocr.infer(buffer_ocr_inp)
+                pred_argmax = np.argmax(pred_ocr, axis=2).flatten()
+
+                texto_temp = ""
+                last = -1
+                for p in pred_argmax:
+                    if p != last and p != 0 and (p - 1) < len(CHARS):
+                        texto_temp += CHARS[p - 1]
+                    last = p
+
+                if len(texto_temp) > 6:
+                    texto_temp = texto_temp[:6]
+
+                # Se obteve um resultado "string" real válido do OCR (não vazio e diferente de "...")
+                if texto_temp.strip() and texto_temp != "...":
+                    texto_ocr_cache = texto_temp
+                    ocr_inicial_realizado = True  # Bloqueia execuções repetidas até p_superior_cache == 0,0
+
+        # --- PROCESSAMENTO GRÁFICO ---
         frame_render = cv2.cvtColor(frame_estabilizado_rgb, cv2.COLOR_RGB2BGR)
 
-        # Apenas as linhas dos ponteiros são desenhadas
-        for pts_hud in linhas_ponteiros_hud:
-            cv2.line(frame_render, pts_hud["eixo"], pts_hud["ponta"], (0, 255, 255), 2)
-
         t_fim_frame = time.perf_counter()
-        tempo_total_frame_ms = (t_fim_frame - t_inicio_frame) * 1000.0
 
         acumulador_tempo_fps += (t_fim_frame - t_anterior)
         t_anterior = t_fim_frame
         contador_fps += 1
         if contador_fps >= 10:
-            fps_atual = contador_fps / acumulador_tempo_fps
             contador_fps = 0;
             acumulador_tempo_fps = 0.0
-
-        print(
-            f"Frame {contador_frames:04d} ({master_engine.backend}) -> Total: {tempo_total_frame_ms:.1f}ms | Pose Batch: {tempo_pose_ms:.1f}ms | FPS Terminal: {fps_atual:.1f}")
-
         # HUD Superior Sem Contador de FPS
         cv2.rectangle(frame_render, (0, 0), (frame_render.shape[1], 45), (0, 0, 0), -1)
-        telemetria = f"OCR: {texto_ocr_cache} | P. Sup: {p_superior_cache:.1f} | P. Inf: {p_inferior_cache:.1f}"
+        telemetria = f"OCR: {texto_ocr_cache} | P. Sup: {valores_analogicos[0]:.1f} | P. Inf: {valores_analogicos[1]:.1f}"
         cv2.putText(frame_render, telemetria, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow(NOME_JANELA, frame_render)
